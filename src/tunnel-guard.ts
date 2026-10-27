@@ -1,4 +1,4 @@
-import { lookup } from "node:dns/promises";
+import { lookup, resolve4 } from "node:dns/promises";
 import { networkInterfaces } from "node:os";
 
 /**
@@ -44,6 +44,19 @@ import { networkInterfaces } from "node:os";
 const RESOLVE_MAX_ATTEMPTS = 3;
 const RESOLVE_BACKOFF_MS = 250;
 const RESOLVE_TIMEOUT_MS = 2000;
+
+// Admission results are cached: the same upstream host is re-admitted on every
+// /bili/ request, and a lookup that misses every time turns one slow resolver
+// into a permanent 502 loop instead of a single retry. A cached answer also
+// outlives a resolver blip (stale-while-error), which is what "the local
+// resolver may be unreachable" in the 502 message is actually describing.
+const RESOLVE_CACHE_TTL_MS = 60_000;
+const RESOLVE_STALE_MS = 10 * 60_000;
+const RESOLVE_CACHE_MAX_ENTRIES = 512;
+// .local is resolved by mDNS first on macOS (resolver timeout 5s) before the
+// unicast answer is tried — longer than the per-attempt budget, so those names
+// get an explicit unicast query instead.
+const MDNS_SUFFIX = ".local";
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
@@ -102,21 +115,128 @@ export type ResolveHost = (host: string) => Promise<string[]>;
 // missing from @types/node's LookupOptions — race instead of casting. The
 // losing lookup stays handled (Promise.race subscribes to both sides), so a
 // late OS-resolver failure cannot surface as an unhandled rejection.
-const dnsResolveHost: ResolveHost = async (host) => {
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-        const res = await Promise.race([
-            lookup(host, { all: true, family: 0 }),
-            new Promise<never>((_, reject) => {
-                timer = setTimeout(() => reject(Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" })), RESOLVE_TIMEOUT_MS);
-                timer.unref?.();
-            }),
-        ]);
-        return res.map((r) => r.address);
-    } finally {
+    const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" })), ms);
+        timer.unref?.();
+    });
+    return Promise.race([work, deadline]).finally(() => {
         if (timer) clearTimeout(timer);
-    }
-};
+    });
+}
+
+const dnsResolveHost: ResolveHost = async (host) =>
+    (await withDeadline(lookup(host, { all: true, family: 0 }), RESOLVE_TIMEOUT_MS)).map((r) => r.address);
+
+// c-ares unicast query: no getaddrinfo, no mDNS detour, no OS resolver state.
+// A-record only — the tunnel connects to one of these addresses, and an
+// AAAA-only destination still has the system resolver as its fallback.
+const dnsResolveUnicast: ResolveHost = (host) => withDeadline(resolve4(host), RESOLVE_TIMEOUT_MS);
+
+export interface AdmissionResolverOptions {
+    /** System (getaddrinfo) resolution — the existing behavior. */
+    systemResolve?: ResolveHost;
+    /** Unicast (c-ares) resolution tried first for mDNS-prone names. */
+    unicastResolve?: ResolveHost;
+    /** Successful answers are reused for this long (0 disables the cache). */
+    ttlMs?: number;
+    /** A last-known-good answer may be reused this long after a failed lookup (0 disables). */
+    staleMs?: number;
+    /** Upper bound on cached hosts — destinations come from client input. */
+    maxEntries?: number;
+    now?: () => number;
+}
+
+export interface AdmissionResolverStats {
+    hits: number;
+    staleHits: number;
+    misses: number;
+    coalesced: number;
+    failures: number;
+    entries: number;
+}
+
+export interface AdmissionResolver extends ResolveHost {
+    stats(): AdmissionResolverStats;
+}
+
+/**
+ * Cache + single-flight + stale-while-error around the admission lookup, with a
+ * unicast-first path for names the OS resolver sends to mDNS first.
+ */
+export function createAdmissionResolver(opts: AdmissionResolverOptions = {}): AdmissionResolver {
+    const systemResolve = opts.systemResolve ?? dnsResolveHost;
+    const unicastResolve = opts.unicastResolve ?? dnsResolveUnicast;
+    const ttlMs = opts.ttlMs ?? RESOLVE_CACHE_TTL_MS;
+    const staleMs = opts.staleMs ?? RESOLVE_STALE_MS;
+    const maxEntries = opts.maxEntries ?? RESOLVE_CACHE_MAX_ENTRIES;
+    const now = opts.now ?? Date.now;
+    const cache = new Map<string, { ips: string[]; at: number }>();
+    const inflight = new Map<string, Promise<string[]>>();
+    const counters = { hits: 0, staleHits: 0, misses: 0, coalesced: 0, failures: 0 };
+
+    const resolveFresh = async (host: string): Promise<string[]> => {
+        if (host.replace(/\.$/, "").endsWith(MDNS_SUFFIX)) {
+            try {
+                const ips = await unicastResolve(host);
+                if (ips.length > 0) return ips;
+            } catch {
+                // Not in unicast DNS (a real mDNS name, or an /etc/hosts entry):
+                // the system resolver is the only path that can still answer.
+            }
+        }
+        return systemResolve(host);
+    };
+
+    const admit = async (host: string): Promise<string[]> => {
+        const key = host.toLowerCase();
+        const cached = cache.get(key);
+        if (ttlMs > 0 && cached && now() - cached.at < ttlMs) {
+            counters.hits++;
+            return cached.ips.slice();
+        }
+        const running = inflight.get(key);
+        if (running) {
+            counters.coalesced++;
+            return running;
+        }
+        counters.misses++;
+        const attempt = (async () => {
+            try {
+                const ips = await resolveFresh(host);
+                if (ips.length > 0) {
+                    if (maxEntries > 0 && !cache.has(key) && cache.size >= maxEntries) {
+                        const oldest = cache.keys().next();
+                        if (!oldest.done) cache.delete(oldest.value);
+                    }
+                    cache.set(key, { ips: ips.slice(), at: now() });
+                }
+                return ips;
+            } catch (err) {
+                counters.failures++;
+                const last = cache.get(key);
+                if (staleMs > 0 && last && now() - last.at < staleMs) {
+                    counters.staleHits++;
+                    return last.ips.slice();
+                }
+                throw err;
+            } finally {
+                inflight.delete(key);
+            }
+        })();
+        inflight.set(key, attempt);
+        return attempt;
+    };
+
+    return Object.assign(admit, { stats: (): AdmissionResolverStats => ({ ...counters, entries: cache.size }) });
+}
+
+export const admissionResolver = createAdmissionResolver();
+
+export function admissionResolveStats(): AdmissionResolverStats {
+    return admissionResolver.stats();
+}
 
 let localAddrCache: { at: number; ips: Set<string> } | undefined;
 /** All addresses considered "this machine": 127/8 + ::1 + every interface unicast addr. */
@@ -189,7 +309,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         // #1686: bounded retry — a transiently unreachable DNS server must not
         // masquerade as a dead name. Only throws are retried; an empty answer
         // is definitive (the resolver said so).
-        const resolve = ctx.resolveHost ?? dnsResolveHost;
+        const resolve = ctx.resolveHost ?? admissionResolver;
         const backoff = ctx.resolveBackoffMs ?? RESOLVE_BACKOFF_MS;
         let resolved: string[] | undefined;
         let lastErrCode: string | undefined;

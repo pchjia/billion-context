@@ -6,6 +6,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Fixed
+- **隧道准入解析加缓存 + `.local` 走单播 (#4973)**:`/bili/<absolute-url>` 的准入校验对每个请求都重新解析目标主机(3 次 × 2s),没有任何缓存;macOS 对未缓存的 `*.local` 名字先走 mDNS(`timeout: 5`)再回落单播,单次冷解析实测 5013ms(dig 10ms / c-ares 6ms),准入预算必然先耗尽 → `502 tunnel_destination_denied/unresolvable`,现场表现为间歇成簇的「cannot resolve tunnel destination … ETIMEDOUT」。现在 `admissionResolver` 带 60s 正向 TTL、10min stale-while-error 兜底、并发单飞与 512 条上限;`.local` 名字优先 c-ares 单播查询,查不到再回落系统解析器;`/__bili/health` 增加 `dnsResolve` 计数。
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
 
 ### Added
